@@ -111,10 +111,14 @@ prefix="$XDG_DATA_HOME/uu-remote-for-linux/wineprefix"
 install_dir="$prefix/drive_c/Program Files/Netease/GameViewer"
 cache_dir="$XDG_CACHE_HOME/uu-remote-for-linux"
 state_dir="$XDG_STATE_HOME/uu-remote-for-linux"
+# osslsigncode 2.13 emits RFC2253 rather than slash-delimited subjects.
+UU_REMOTE_FAKE_SIGNATURE_RFC2253=1 "$launcher" --refresh-installer \
+    >"$test_root/rfc2253.out" 2>"$test_root/rfc2253.err"
 installer_before=$(sha256sum "$cache_dir/UURemote_Setup.exe")
 installer_before=${installer_before%% *}
 for signature_failure in UU_REMOTE_FAKE_SIGNATURE_FAILURE \
-    UU_REMOTE_FAKE_SIGNATURE_WRONG_PUBLISHER; do
+    UU_REMOTE_FAKE_SIGNATURE_WRONG_PUBLISHER \
+    UU_REMOTE_FAKE_SIGNATURE_EMBEDDED_ORG; do
     if env "$signature_failure=1" "$launcher" --refresh-installer \
         >"$test_root/${signature_failure}.out" \
         2>"$test_root/${signature_failure}.err"; then

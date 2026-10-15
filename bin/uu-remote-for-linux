@@ -4167,8 +4167,23 @@ verify_official_installer_signature() {
             exit
         }
         ' "$output_file")
-    if ((status != 0)) ||
-        [[ $signer_subject != *"/O=$expected_signer/"* ]]; then
+    # Split RFC2253 only at unescaped separators: a publisher name inside
+    # another attribute must not be mistaken for the organization itself.
+    if ((status != 0)) || ! python3 - "$signer_subject" "$expected_signer" <<'PY_SIGNER'
+import csv
+import sys
+
+subject, expected = sys.argv[1:]
+if subject.startswith("/"):
+    attributes = subject[1:].split("/")
+else:
+    attributes = next(csv.reader(
+        [subject], delimiter=",", escapechar="\\", quoting=csv.QUOTE_NONE
+    ))
+organizations = [value[2:] for value in attributes if value.startswith("O=")]
+sys.exit(0 if organizations == [expected] else 1)
+PY_SIGNER
+    then
         rm -f -- "$output_file"
         return 1
     fi
