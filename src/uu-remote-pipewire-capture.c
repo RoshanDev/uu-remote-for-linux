@@ -26,7 +26,7 @@
 #include <drm_fourcc.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 #include <pipewire/pipewire.h>
 #include <spa/buffer/buffer.h>
@@ -36,6 +36,10 @@
 #include <spa/param/video/format-utils.h>
 #include <spa/param/video/raw.h>
 #include <spa/pod/builder.h>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#include <spa/pod/filter.h>
+#pragma GCC diagnostic pop
 #include <spa/utils/result.h>
 
 #define UUDC_STAGE_SLOTS 3u
@@ -82,6 +86,8 @@ struct application {
     uint32_t node;
     uint32_t width;
     uint32_t height;
+    uint32_t source_width;
+    uint32_t source_height;
     uint32_t stride;
     uint32_t drm_format;
     uint64_t modifier;
@@ -104,6 +110,8 @@ struct application {
     PFNEGLDESTROYIMAGEKHRPROC egl_destroy_image;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture;
     struct image_cache images[UUDC_PIPEWIRE_BUFFERS];
+    GLuint scaled_texture;
+    GLuint scaled_framebuffer;
     unsigned char *rgba_scratch;
     bool direct_bgra_read;
     bool modifier_import;
@@ -208,6 +216,7 @@ static EGLDisplay choose_egl_display(struct application *application)
     EGLint index;
     EGLDeviceEXT selected = EGL_NO_DEVICE_EXT;
     const char *selected_path = NULL;
+    const char *preferred = getenv("UU_REMOTE_EGL_DEVICE");
 
     get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
         eglGetProcAddress("eglGetPlatformDisplayEXT");
@@ -228,6 +237,14 @@ static EGLDisplay choose_egl_display(struct application *application)
                     devices[index],
                     EGL_DRM_DEVICE_FILE_EXT
                 );
+            }
+            if (preferred && *preferred) {
+                if (path && strcmp(path, preferred) == 0) {
+                    selected = devices[index];
+                    selected_path = path;
+                    break;
+                }
+                continue;
             }
             if (!selected && path) {
                 selected = devices[index];
@@ -254,6 +271,10 @@ static EGLDisplay choose_egl_display(struct application *application)
                 NULL
             );
         }
+    }
+    if (preferred && *preferred) {
+        fprintf(stderr, "requested EGL device unavailable: %s\n", preferred);
+        return EGL_NO_DISPLAY;
     }
     if (get_platform_display) {
         snprintf(
@@ -368,7 +389,7 @@ static bool initialize_egl(struct application *application)
     EGLint minor = 0;
     const EGLint config_attributes[] = {
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
@@ -376,7 +397,7 @@ static bool initialize_egl(struct application *application)
         EGL_NONE,
     };
     const EGLint context_attributes[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_NONE,
     };
     const EGLint surface_attributes[] = {
@@ -511,6 +532,8 @@ static void destroy_egl(struct application *application)
         for (index = 0; index < UUDC_PIPEWIRE_BUFFERS; ++index) {
             destroy_image_cache(application, &application->images[index]);
         }
+        glDeleteFramebuffers(1, &application->scaled_framebuffer);
+        glDeleteTextures(1, &application->scaled_texture);
     }
     if (application->egl_display != EGL_NO_DISPLAY) {
         eglMakeCurrent(
@@ -571,8 +594,8 @@ static struct image_cache *get_image_cache(
         attributes[n++] = (key); \
         attributes[n++] = (EGLint)(value); \
     } while (0)
-    ADD_ATTRIBUTE(EGL_WIDTH, application->width);
-    ADD_ATTRIBUTE(EGL_HEIGHT, application->height);
+    ADD_ATTRIBUTE(EGL_WIDTH, application->source_width);
+    ADD_ATTRIBUTE(EGL_HEIGHT, application->source_height);
     ADD_ATTRIBUTE(EGL_LINUX_DRM_FOURCC_EXT, application->drm_format);
     ADD_ATTRIBUTE(EGL_DMA_BUF_PLANE0_FD_EXT, fd);
     ADD_ATTRIBUTE(EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset);
@@ -679,6 +702,30 @@ static bool read_dma_buf(
         return false;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, cache->framebuffer);
+    if (application->source_width != application->width ||
+        application->source_height != application->height) {
+        if (!application->scaled_framebuffer) {
+            glGenTextures(1, &application->scaled_texture);
+            glBindTexture(GL_TEXTURE_2D, application->scaled_texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                application->width, application->height, 0,
+                GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glGenFramebuffers(1, &application->scaled_framebuffer);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, application->scaled_framebuffer);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D, application->scaled_texture, 0);
+            if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                fprintf(stderr, "scaled capture framebuffer is incomplete\n");
+                return false;
+            }
+        }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, cache->framebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, application->scaled_framebuffer);
+        glBlitFramebuffer(0, 0, application->source_width, application->source_height,
+            0, 0, application->width, application->height,
+            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_FRAMEBUFFER, application->scaled_framebuffer);
+    }
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(
         0,
@@ -865,8 +912,9 @@ static void on_param_changed(
     }
     memset(&raw, 0, sizeof(raw));
     if (spa_format_video_raw_parse(param, &raw) < 0 ||
-        raw.size.width != application->width ||
-        raw.size.height != application->height ||
+        raw.size.width == 0 || raw.size.width > 16384 ||
+        raw.size.height == 0 || raw.size.height > 16384 ||
+        (uint64_t)raw.size.width * raw.size.height * 4u > INT32_MAX ||
         (raw.format != SPA_VIDEO_FORMAT_BGRA &&
          raw.format != SPA_VIDEO_FORMAT_BGRx)) {
         pw_stream_set_error(
@@ -879,7 +927,16 @@ static void on_param_changed(
     application->drm_format = raw.format == SPA_VIDEO_FORMAT_BGRA
         ? DRM_FORMAT_ARGB8888
         : DRM_FORMAT_XRGB8888;
-    application->stride = application->width * 4u;
+    /* Portal sizes are logical coordinates; PipeWire buffers are pixels. */
+    if (application->source_width != raw.size.width ||
+        application->source_height != raw.size.height) {
+        for (uint32_t i = 0; i < UUDC_PIPEWIRE_BUFFERS; ++i) {
+            destroy_image_cache(application, &application->images[i]);
+        }
+    }
+    application->source_width = raw.size.width;
+    application->source_height = raw.size.height;
+    application->stride = raw.size.width * 4u;
     application->modifier = DRM_FORMAT_MOD_INVALID;
     modifier_property = spa_pod_find_prop(
         param,
@@ -934,7 +991,7 @@ static void on_param_changed(
         SPA_PARAM_BUFFERS_blocks,
         SPA_POD_Int(1),
         SPA_PARAM_BUFFERS_size,
-        SPA_POD_Int((int32_t)application->frame_size),
+        SPA_POD_Int((int32_t)(application->stride * application->source_height)),
         SPA_PARAM_BUFFERS_stride,
         SPA_POD_Int((int32_t)application->stride),
         SPA_PARAM_BUFFERS_dataType,
@@ -1050,7 +1107,8 @@ static const struct spa_pod *build_capture_format(
     spa_pod_builder_add(
         builder,
         SPA_FORMAT_VIDEO_size,
-        SPA_POD_Rectangle(size),
+        SPA_POD_CHOICE_RANGE_Rectangle(size,
+            &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(16384, 16384)),
         0
     );
     return spa_pod_builder_pop(builder, &format_frame);
@@ -1110,6 +1168,34 @@ static int connect_stream(struct application *application)
     );
 }
 
+static bool test_scaled_format_negotiation(void)
+{
+    uint8_t consumer_buffer[1024], producer_buffer[1024], result_buffer[2048];
+    struct spa_pod_builder consumer = SPA_POD_BUILDER_INIT(consumer_buffer, sizeof(consumer_buffer));
+    struct spa_pod_builder producer = SPA_POD_BUILDER_INIT(producer_buffer, sizeof(producer_buffer));
+    struct spa_pod_builder result = SPA_POD_BUILDER_INIT(result_buffer, sizeof(result_buffer));
+    struct modifier_set modifiers = { .values = { DRM_FORMAT_MOD_LINEAR }, .count = 1 };
+    const struct spa_rectangle logical = SPA_RECTANGLE(1600, 1000);
+    const struct spa_rectangle physical = SPA_RECTANGLE(3200, 2000);
+    const struct spa_pod *offered = spa_pod_builder_add_object(
+        &producer, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
+        SPA_FORMAT_VIDEO_modifier, SPA_POD_Long(DRM_FORMAT_MOD_LINEAR),
+        SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&physical));
+    const struct spa_pod *requested = build_capture_format(
+        &consumer, SPA_VIDEO_FORMAT_BGRx, &modifiers, &logical);
+    struct spa_pod *filtered = NULL;
+    struct spa_video_info_raw raw = {0};
+
+    if (spa_pod_filter(&result, &filtered, offered, requested) < 0 || !filtered)
+        return false;
+    spa_pod_fixate(filtered);
+    return spa_format_video_raw_parse(filtered, &raw) >= 0 &&
+        raw.size.width == physical.width && raw.size.height == physical.height;
+}
+
 static int self_test(void)
 {
     struct frame_notification notification;
@@ -1134,6 +1220,10 @@ static int self_test(void)
         destination[4] != 7 || destination[5] != 6 ||
         destination[6] != 5 || destination[7] != 8) {
         fprintf(stderr, "native capture pixel conversion self-test failed\n");
+        return 1;
+    }
+    if (!test_scaled_format_negotiation()) {
+        fprintf(stderr, "scaled Portal/PipeWire format negotiation failed\n");
         return 1;
     }
     printf("PipeWire DMA-BUF capture self-test passed\n");

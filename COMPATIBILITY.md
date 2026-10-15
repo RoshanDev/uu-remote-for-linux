@@ -63,3 +63,27 @@
 - Wayland 上 Portal 重连、DMA-BUF 三缓冲、多屏、拼音提交与无旧新帧 ABA 测试。
 
 没有以上证据时，新版本只能使用不依赖该补丁的安全回退路径，不能标记为兼容。
+
+## 缩放桌面的原生采集
+
+Portal 返回的是合成器逻辑坐标，PipeWire 视频流可能使用实际像素尺寸。
+例如 3200×2000、200% 缩放的桌面会同时报告 1600×1000 逻辑尺寸与
+3200×2000 视频流。本项目协商实际视频尺寸，按实际尺寸导入 DMA-BUF，
+通过 GLES 3 framebuffer blit 缩放为共享帧协议使用的逻辑尺寸；鼠标坐标
+仍使用 Portal 的逻辑坐标。采集 helper 现在需要 GLES 3。
+
+混合显卡机器可为原生输入桥的用户服务设置 `UU_REMOTE_EGL_DEVICE`，
+显式选择与合成器输出匹配的 DRM render node。未指定时保留原有设备选择；
+指定设备不存在时明确失败，不悄悄切换设备。例如在
+`~/.config/systemd/user/uu-remote-for-linux-input.service.d/graphics.conf` 中：
+
+```ini
+[Service]
+Environment=UU_REMOTE_EGL_DEVICE=/dev/dri/renderD128
+Environment=UU_REMOTE_WAYLAND_CURSOR_MODE=embedded
+```
+
+设备编号必须按本机核对。使用 `systemctl --user daemon-reload` 后，
+在没有远控会话时重新启动 UU。该配置只影响项目的原生采集与输入桥。
+200% 缩放下已验证内嵌光标；独立光标元数据中的物理/逻辑坐标及图案缩放
+尚需单独处理，推荐上述 `embedded` 模式。

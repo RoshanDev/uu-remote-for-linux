@@ -198,6 +198,7 @@ static EGLDisplay choose_egl_display(struct application *application)
     EGLint index;
     EGLDeviceEXT selected = EGL_NO_DEVICE_EXT;
     const char *selected_path = NULL;
+    const char *preferred = getenv("UU_REMOTE_EGL_DEVICE");
 
     get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
         eglGetProcAddress("eglGetPlatformDisplayEXT");
@@ -218,6 +219,14 @@ static EGLDisplay choose_egl_display(struct application *application)
                     devices[index],
                     EGL_DRM_DEVICE_FILE_EXT
                 );
+            }
+            if (preferred && *preferred) {
+                if (path && strcmp(path, preferred) == 0) {
+                    selected = devices[index];
+                    selected_path = path;
+                    break;
+                }
+                continue;
             }
             if (!selected && path) {
                 selected = devices[index];
@@ -244,6 +253,10 @@ static EGLDisplay choose_egl_display(struct application *application)
                 NULL
             );
         }
+    }
+    if (preferred && *preferred) {
+        fprintf(stderr, "requested EGL device unavailable: %s\n", preferred);
+        return EGL_NO_DISPLAY;
     }
     if (get_platform_display) {
         snprintf(
@@ -1110,7 +1123,8 @@ static const struct spa_pod *build_cursor_format(
     spa_pod_builder_add(
         builder,
         SPA_FORMAT_VIDEO_size,
-        SPA_POD_Rectangle(size),
+        SPA_POD_CHOICE_RANGE_Rectangle(size,
+            &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(16384, 16384)),
         0
     );
     return spa_pod_builder_pop(builder, &format_frame);
